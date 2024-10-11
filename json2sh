@@ -1,0 +1,342 @@
+#!/bin/sh
+#
+
+######################################################################
+#
+# JSON2SH
+#   A JSON Parser Which Convert Into "Insert into Shell variable"
+#
+# === What is "Insert into Shell variable" Formatted Text? ===
+# 1. Format
+#    <JSONPath_string#1>="<value_at_that_path#1>"
+#    <JSONPath_string#2>="<value_at_that_path#2>"
+#    <JSONPath_string#3>="<value_at_that_path#3>"
+#             :              :              :
+#
+#    The output result can be assigned to a shell variable by `eval'.
+#
+# === This Command will Do Like the Following Conversion ===
+# 1. Input Text (JSON)
+#    {"hoge":111,
+#     "foo" :["2\n2",
+#             {"bar" :"3 3",
+#              "fizz":{"bazz":444}
+#             },
+#             "\u5555"
+#            ]
+#    }
+# 2. Output Text This Command Converts Into
+#    _hoge="111"
+#    _foo_0="2\n2"
+#    _foo_1_bar="3 3"
+#    _foo_1_fizz_bazz="444"
+#    _foo_2="\u5555"
+#    __NUM_foo=3
+#
+# === Usage ===
+# Usage   : json2sh [options] [JSON_file]
+# Options : -v      Verbose output
+#         : -e      Escape the following characters in impolite JSON key fields
+#                   (" ",<0x09>,".","[","]")
+#
+# Written by IMAIZUMI Mitzyuki (@bsdehack) on 2024-10-11
+#
+# This is a public-domain software (CC0). It means that all of the
+# people can use this for any purposes with no restrictions at all.
+# By the way, We are fed up with the side effects which are brought
+# about by the major licenses.
+#
+######################################################################
+
+#
+# state transition table
+#
+#           st      l0      l1      l2      h0      h1      h2      h3      h4
+#
+# '{'       h0      h0      h0      -       -       -       -       -       h0
+#
+# '}'       -       -       -       -    st/l2/h4   -       -       -    st/l2/h4
+#
+# '['       l0      l0      l0      -       -       -       -       l0      -
+#
+# ']'       -    st/l2/h4   -    st/l2/h4   -       -       -       -       -
+#
+# ':'       -       -       -       -       -       -       h3      -       -
+#
+# ','       -       -       -       l1      -       -       -       -       h1
+#
+# *         -       l2      l2      -       h2      h2      -       h4      -
+#
+
+ht=$(printf '\t')
+dq=$(printf '\026')
+lf=$(printf '\\\n_'); lf=${lf%_}
+
+# parse args
+while [ "${1}" ]
+do
+	case "${1}" in
+		-v | --verbose )
+			verbose=1
+			;;
+		-e | --escape )
+			escape=1
+			;;
+		* )
+			echo "$(basename $0) [-v][-e]" 1>&2
+			exit 1
+			;;
+	esac
+	shift
+done
+
+######################################################################
+# Main Routine (Convert and Generate)
+######################################################################
+
+# convert each " to new "\n" instead of original "\n"
+tr -d '\n' |
+tr '"' '\n' |
+
+# discriminate " as just a letter from " as a segment
+awk -v "dq=${dq}" '
+{
+
+	OFS = "";
+	ORS = "";
+
+	len = length($0);
+	if(substr($0, len) != "\\" || match($0, /^(\\\\)+$|[^\\](\\\\)+$/))
+		print $0, "\n";
+	else
+		print substr($0, 1, len-1), dq;
+
+}' |
+
+# restore " to the head and tail of lines
+awk '
+{
+
+	OFS = "";
+
+	if(NR % 2)
+		print $0
+	else
+		print "\"", $0, "\"";
+
+}' |
+
+# Insert "\n" into the head and the tail of the lines which are
+sed "/^[^\"]/s/\([][{}:,]\)/${lf}\1${lf}/g" |
+
+# Cut the unnecessary spaces and tabs and "\n"s
+sed -e "s/^[ ${ht}]\{1,\}//" -e "s/[ ${ht}]\{1,\}$//" -e "/^[ ${ht}]*$/d" |
+
+# parse JSON
+awk -v "dq=${dq}" -v "verbose=${verbose:-0}" -v "escape=${escape:-0}" '
+{
+
+	OFS = "";
+	ORS = "";
+
+	# "{"
+	if($0 == "{"){
+		if(depth == 0 || category[depth] == "l0" || category[depth] == "l1" || category[depth] == "h3"){
+			category[++depth] = "h0";
+			next;
+		}
+		errro();
+	}
+
+	# "}"
+	else if($0 == "}"){
+		if(depth > 0){
+			s = category[depth];
+			if(s == "h0" || s == "h4"){
+				delete category[depth];
+				delete name[depth];
+				if(--depth > 0){
+					if(category[depth] == "l0" || category[depth] == "l1")
+						category[depth] = "l2"
+					else if(category[depth] == "h3")
+						category[depth] = "h4"
+				}
+				next;
+			}
+		}
+		error()
+	}
+
+	# "["
+	else if($0 == "["){
+		if(depth == 0 || category[depth] == "l0" || category[depth] == "l1" || category[depth] == "h3"){
+			category[++depth] = "l0";
+			name[depth] = "0";
+			max[getname()] = name[depth];
+			next;
+		}
+		error();
+	}
+
+	# "]"
+	else if($0 == "]"){
+		if(depth > 0){
+			s = category[depth];
+			if(s == "l0" || s == "l2"){
+				delete category[depth];
+				delete name[depth];
+				if(--depth > 0)
+					if(category[depth] == "l0" || category[depth] == "l1")
+						category[depth] = "l2"
+					else if(category[depth] == "h3")
+						category[depth] = "h4"
+				next;
+			}
+		}
+		error()
+	}
+
+	# ":"
+	else if($0 == ":"){
+		if(depth > 0 && category[depth] == "h2"){
+			category[depth] = "h3";
+			next;
+		}
+		error();
+	}
+
+	# ","
+	else if($0 == ","){
+		# Confirm the datacat stack is not empty
+		if(depth){
+			# Do someting according to the top of datacat stack
+			# When "l2" (list-step2 : just after getting a value in list)
+			if(category[depth] == "l2"){
+				category[depth] = "l1";
+				name[depth]++;
+				max[getname()] = name[depth];
+				next;
+			}
+			# When "lh" (hash-step4 : just after getting a value in hash)
+			else if(category[depth] == "h4"){
+				category[depth] = "h1";
+				next;
+			}
+		}
+		# Other cases (error)
+		error();
+	}
+
+	# In another line case
+	else{
+		# Confirm the datacat stack is not empty
+		if(depth){
+			# Remove the head/tail DQs quoting a string when they exists
+			# Unescape the escaped DQs
+			if(match($0, /^".*"$/)){
+				gsub(dq, "\\\"", $0);
+				key = value = substr($0, 2, length($0) - 2);
+			}
+			else{
+				gsub(dq, "\\\"", $0);
+				key = $0;
+				value = $0;
+			}
+			# Escape
+			if(escape){
+				gsub(/ / , "\\u0020", key);
+				gsub(/\t/, "\\u0009", key);
+				gsub(/\./, "\\u002e", key);
+				gsub(/\[/, "\\u005b", key);
+				gsub(/\]/, "\\u005d", key);
+			}
+
+			# Do someting according to the top of datacat stack
+			# When "l0" (list-step0 : waiting for the 1st value)
+			s = category[depth];
+			if(s == "l0" || s == "l1"){
+				printnode(value);
+				category[depth] = "l2";
+			}
+			# When "h0,1" (hash-step0,1 : waiting for the 1st or next key)
+			else if(s == "h0" || s == "h1"){
+				gsub(/ /, "_", key);
+				name[depth] = key;
+				category[depth] = "h2";
+			}
+			# When "h3" (hash-step3 : waiting for a value of hash)
+			else if(s == "h3"){
+				printnode(value);
+				category[depth] = "h4";
+			}
+			# Other cases (error)
+			else{
+				error();
+			}
+		}
+		else {
+			error();
+		}
+	}
+
+}
+END {
+
+	printmax();
+
+}
+
+#
+# The Functions printing name-value
+#
+function	printnode(str,			i)
+{
+
+	for(i=1; i<=depth; i++)
+		print "_", name[i];
+	print "=", "\"", str, "\"\n";
+
+}
+
+#
+# The Functions printing array max num
+#
+function	printmax(			i)
+{
+
+	for(i in max)
+		print "__NUM", i, "=", max[i] + 1, "\n";
+
+}
+
+#
+# The Functions get name of JSONPath
+#
+function	getname(			n, i)
+{
+
+	for(i=1; i<depth; i++)
+		n = n "_" name[i]
+
+	return n
+
+}
+
+#
+# Error Handler
+#
+function	error(			i)
+{
+
+	if(verbose){
+		line1 = "name stack: ";
+		line2 = "category stack: ";
+		for(i=1; i<=depth; i++){
+			line1 = line1 sprintf("{%s}", name[i]);
+			line2 = line2 sprintf("{%s}", category[i]);
+		}
+		print "Invalid JSON format\n", line1, "\n", line2, "\n" | "cat 1>&2";
+	}
+	exit 1
+
+}'
